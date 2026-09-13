@@ -3,8 +3,8 @@ langchain-openai>=1.5
 pydantic>=2
 python-dotenv
 
-# InMemoryVectorStore 의 cosine similarity 계산에 필요
-numpy
+# numpy 는 기억 RAG(InMemoryVectorStore) 전용이었다 — 저장소 파킹(2026-09-13)과 함께 뺐다.
+# 되살리면 다시 넣는다 (`parked/memory/README` 참조).
 
 # 카카오 로컬 API (장소 검색) / YouTube Data API v3 (영상 + 베스트 댓글)
 httpx

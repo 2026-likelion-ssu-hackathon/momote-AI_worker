@@ -44,7 +44,7 @@ cp .env.example .env      # OPENAI_API_KEY 채우기 (나머지는 선택)
 | 옵션 | 설명 |
 | --- | --- |
 | `--verbose` `-v` | 분절 점수, 게이트 판정, 검색된 기억, 외부 API 결과 표시 |
-| `--no-persist` | `used_at`·기억 저장을 파일에 쓰지 않는다 (**반복 시연용**) |
+| `--no-persist` | (기억 저장소 파킹 뒤로 효과 없음 — 호환용) |
 | `--json` | 백엔드에 나가는 규격서 응답을 그대로 출력 |
 
 여러 개를 한 번에 돌릴 수 있다: `.venv/bin/python -m tools.run fixtures/*.json --no-persist`

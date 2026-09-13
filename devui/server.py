@@ -136,8 +136,8 @@ def _trace_json(trace: Trace) -> dict:
             "toneCut": segment.TONE_CUT,
             "gapSoftMinutes": int(segment.GAP_SOFT.total_seconds() // 60),
         },
-        "extracted": _jsonable(trace.extracted),
-        "savedIds": [m.id for m in trace.saved],
+        "extracted": [],   # 기억 저장소 파킹 (2026-09-13) — 화면 호환용 빈 값
+        "savedIds": [],
         # 실 상태 표현 — 감정 점수와 **거기서 룰이 고른 라벨.**
         # 판정을 코드로 옮긴 값어치가 여기서도 보인다. `note` 는 내부용이라 화면 문구가 아니다.
         "stateScored": [
@@ -152,7 +152,7 @@ def _trace_json(trace: Trace) -> dict:
         "toneGate": _jsonable(trace.tone_gate),
         "toneJudged": _jsonable(trace.tone_judged),
         "dateGate": _jsonable(trace.date_gate),
-        "dateMemories": _jsonable(trace.date_memories),
+        "dateMemories": [],
         "datePlan": _jsonable(trace.date_plan),
         "datePlaces": _jsonable(trace.date_places),
         "concern": _jsonable(trace.concern),
@@ -177,7 +177,7 @@ def _run(payload: dict, persist: bool) -> dict:
     with _LOCK:
         mark = len(USAGE.records)
         started = time.perf_counter()
-        response, trace = analyze(payload, persist=persist, wait_background=True)
+        response, trace = analyze(payload, persist=persist)
         elapsed = time.perf_counter() - started
         # 이번 요청에서 난 호출만 잘라낸다. USAGE 는 프로세스 전역 누적이다.
         records = USAGE.records[mark:]

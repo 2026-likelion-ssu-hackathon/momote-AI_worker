@@ -155,8 +155,7 @@ router.run()                **전부 여기서** — 독립인 것은 동시에 
    │                        이후 단계는 전부 **활성 세그먼트(마지막)** 만 본다
    │   ├ read_state()        실 상태 — 위젯 ①번 줄, 게이트 없이 매 요청
    │   ├ 데이트 계획 → 카카오 → 데이트 문구
-   │   ├ 유튜브 (말투 결과를 본 뒤)
-   │   └ harvest_memories()  기억 추출 → 저장. **백그라운드** — 응답을 기다리게 하지 않는다
+   │   └ 유튜브 (말투 결과를 본 뒤)
    ↓                        후보 결과는 우선순위 순으로 정렬 — 위젯 ②번 줄
    │
    ├─ 1. 갈등 중재 (TONE_CORRECTION)
@@ -166,8 +165,7 @@ router.run()                **전부 여기서** — 독립인 것은 동시에 
    │
    ├─ 2. 데이트 코스 (DATE_RECOMMENDATION)
    │     check_date_gate()   룰 — 데이트 의도 4종
-   │     retrieve_many()     RAG — 대화 맥락과 유사한 기억
-   │     plan_date()         LLM — 무엇을 검색할지 (장소를 지어내지 않는다)
+   │     plan_date()         LLM — 무엇을 검색할지 (장소를 지어내지 않는다) — 근거는 현재 대화
    │     search_places()     카카오 로컬 API — 실재하는 장소
    │     write_reason()      LLM — 코스명·요약·추천 이유
    │
@@ -222,11 +220,12 @@ POST /internal/v1/chat-analyses   GET /health   GET /docs · /openapi.json
 
 - **Python 3.11+** (`.venv` 사용 — `.venv/bin/python`)
 - **LangChain 1.x** — `langchain`, `langchain-openai`
-- **RAG** — `OpenAIEmbeddings` + `InMemoryVectorStore` (기억 검색)
-- **numpy** — `InMemoryVectorStore`의 cosine similarity 계산에 필요
 - **httpx** — 카카오 로컬 API, YouTube Data API
 
-LangChain을 import하는 파일은 `worker/llm.py`와 `worker/retrieve.py` 둘뿐이다.
+(RAG 기억 검색 — `OpenAIEmbeddings` + `InMemoryVectorStore` + numpy — 은 2026-09-13
+파킹됐다. `parked/memory/`.)
+
+LangChain을 import하는 파일은 `worker/llm.py` 하나뿐이다.
 나머지는 전부 순수 파이썬이다. LangChain은 OpenAI를 부르는 어댑터로만 쓰고,
 판정 품질을 만드는 로직(게이트·필터·라우터)은 직접 짠 코드다.
 
@@ -270,7 +269,7 @@ API 산출물을 미리 받아둔 것이라 "실재하는 것만" 원칙 그대�
 | | 지금 | 후속 |
 | --- | --- | --- |
 | 입력 | `fixtures/*.json` + **HTTP POST** (`worker/api.py`) | — |
-| 기억 저장 | `data/memories.json` | Postgres |
+| 기억 저장 | ⏸️ 파킹 (`parked/memory/`, 2026-09-13) | 방 단위 저장소로 복원 |
 | 출력 | 콘솔 / `--json` / `devui` / **HTTP 응답** | — |
 | 배선 | 함수 호출 + `router.py` | — |
 | 배포 | `Dockerfile` + `railway.json` (Railway) | — |
@@ -302,7 +301,7 @@ AI-Worker/
 │   ├── demo.md                  ← 시연 진행 대본 (한 흐름, 본번용)
 │   ├── tech-qa.md               ← 기술 QA 대비 (예상 질문·숫자·약점)
 │   └── QA.md                    ← 배포 QA 기록 (2026-08-20 실측)
-├── parked/                      ← 대화 소재 기능 아카이브 (import 되지 않음)
+├── parked/                      ← 아카이브 (import 되지 않음) — 대화 소재 · 기억 저장소(memory/)
 ├── .env.example
 ├── requirements.txt
 ├── fixtures/                    ← case1~case20, 규격서 요청 형식
@@ -326,8 +325,6 @@ AI-Worker/
     ├── limits.py                ← 화면 글자 수 한도 (검사 → 재생성 → 절단)
     ├── segment.py               ← 대화 분절 (모든 단계보다 먼저)
     ├── state.py                 ← 실 상태 표현 (위젯 ①번 줄, 상시)
-    ├── extract.py               ← 기억 추출 (모든 후보가 공유)
-    ├── retrieve.py              ← RAG 기억 검색
     │
     ├── tone.py / profile.py     ← [1] 갈등 중재
     ├── date_course.py / places.py  ← [2] 데이트 코스 (+ 카카오)
@@ -336,7 +333,6 @@ AI-Worker/
     └── prompts/
         ├── segment.md
         ├── state.md
-        ├── extract.md
         ├── tone_judge.md / tone_suggest.md
         ├── date_plan.md / date_reason.md
         ├── yt_concern.md / yt_pick.md       ← 유튜브 고민 갈래 (유일하게 활성)
@@ -569,6 +565,11 @@ AI-Worker/
 
 **장소는 카카오 로컬 API 로만 가져온다.** LLM 은 검색어와 이유만 만든다 (위 아키텍처 참조).
 
+> ⏸️ **기억 저장소(RAG)는 2026-09-13 파킹됐다** (`parked/memory/`). 방이 여러 개가 되면서
+> 전역 저장소가 다른 커플의 발화를 근거로 인용할 수 있어서다. 지금 `recommendationReason`
+> 은 **현재 대화만** 인용한다. 아래 "기억 저장소 + RAG" 절과 명세의 "과거 기억 최우선"은
+> 복원 시의 설계다.
+
 **코스는 밥 → 구경 → 카페 세 자리로 고정이다** (`date_course.SLOTS`).
 
 | 자리 | 허용 카테고리 |
@@ -697,7 +698,11 @@ AI-Worker/
 
 ---
 
-## 기억 저장소 + RAG
+## 기억 저장소 + RAG — ⏸️ 파킹됨 (2026-09-13, `parked/memory/`)
+
+> 방을 사용자마다 만들 수 있게 되면서 전역 저장소 하나가 다른 커플의 발화를 인용하는
+> 문제가 생겨 **일단 파이프라인에서 뗐다.** 아래는 파킹 전 설계고, 복원 시 방 단위로
+> 갈라야 한다 — 방법은 `parked/README.md`.
 
 데이트 코스 추천의 근거가 되는 저장소. 없으면 "왜 이 장소인지"를 말할 수 없어서
 그냥 아무 맛집이나 추천하는 서비스가 된다.
@@ -754,8 +759,7 @@ AI-Worker/
 해커톤 목표는 심사위원에게 "진짜 웃긴 팀, 잘되겠다"는 반응을 얻는 것이다.
 
 - 3분 데모에서 보여줄 수 없는 기능에 시간을 쓰지 않는다
-- **반복 시연은 `--no-persist`로 돌린다.** 안 그러면 소환된 기억에 `used_at`이 찍혀서
-  두 번째부터 다른 결과가 나온다
+- `--no-persist` 는 기억 저장소 파킹 뒤로 효과가 없다 (호환용으로만 남음)
 - **시연 강제 트리거** — `KAKAPO_DEMO_TRIGGERS=1` 이면 방금 발화의 '데이트' 낱말로
   게이트·억제·LLM 보류를 건너뛰고 무조건 발동한다 (`router.demo_hit`). 기본 꺼짐.
   절대 제약(금지어 필터·실장소/실영상·자수 한도)은 데모에서도 그대로다.
@@ -765,7 +769,7 @@ AI-Worker/
 
 | 케이스 | 보여주는 것 |
 | --- | --- |
-| `case9_date` | RAG + 실재 장소 — 기억을 근거로 진짜 가게와 링크를 가져온다 |
+| `case9_date` | 실재 장소 — 대화를 근거로 진짜 가게와 링크를 가져온다 (RAG 는 파킹) |
 | `case7_tone` | 갈등 중재 — 공격 표현 → 보낸 사람에게만 대체 문장 |
 | `case8_banter` | 안전장치 — 똑같이 비속 표현인데 장난이면 아무것도 안 뜬다 |
 | `case10_concern` | 유튜브 — 댓글까지 읽고 고른다 |

@@ -31,7 +31,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -40,8 +39,7 @@ from typing import Protocol
 
 from worker import date_course, places, state, youtube
 from worker.copy import TONE_GUIDE
-from worker.date_course import COURSE_PLACES, MEMORY_K, MEMORY_KINDS
-from worker.extract import extract_memories
+from worker.date_course import COURSE_PLACES
 from worker.filter import banned_in, banned_in_state, find_banned, is_clean
 from worker.limits import enforce, over_limit
 from worker.models import (
@@ -52,7 +50,6 @@ from worker.models import (
     DatePlanLLMOutput,
     EmotionAnalysis,
     EmotionScores,
-    Memory,
     Message,
     Segment,
     SegmentScore,
@@ -65,7 +62,6 @@ from worker.models import (
 )
 from worker.places import KakaoPlace
 from worker.profile import resolve_profile
-from worker.retrieve import mark_used, recent_context, retrieve_many, save_memories
 from worker.segment import active_context, rule_tail, segment
 from worker.tone import (
     check_tone_gate,
@@ -167,11 +163,6 @@ class Trace:
         self.scores: list[SegmentScore] = []  # 발화별 연속성 점수 (왜 잘렸는지)
         self.segment_cached = 0   # 점수 캐시에서 가져온 발화 수
         self.segment_scored = 0   # LLM 에 물은 발화 수
-        # 응답 뒤에도 도는 작업 (기억 추출). CLI·devui 는 기다려서 보여주고 서버는 안 기다린다.
-        self.background: list[Future] = []
-        # 기억
-        self.extracted: list[Memory] = []
-        self.saved: list[Memory] = []
         # 실 상태 표현 (위젯 ①번 줄)
         self.states: list[EmotionAnalysis] = []
         self.state_scored: list[EmotionScores] = []  # 감정 5축 점수 + 근거 (내부용)
@@ -180,7 +171,6 @@ class Trace:
         self.tone_judged: ToneJudgeLLMOutput | None = None
         # 데이트 코스
         self.date_gate: DateGateResult | None = None
-        self.date_memories: list[Memory] = []
         self.date_plan: DatePlanLLMOutput | None = None
         self.date_places: list[KakaoPlace] = []
         # 유튜브
@@ -208,7 +198,7 @@ class Context:
     request: AnalysisRequest
     messages: list[Message]          # 전체 스트림. 말투 기준선 계산에만 쓴다
     now: datetime
-    persist: bool = True
+    persist: bool = True  # 기억 저장소 파킹(2026-09-13) 뒤로는 쓰이지 않는다. CLI·API 인터페이스 호환용
     trace: Trace = field(default_factory=Trace)
 
     # 분절 결과. `split()` 이 채운다.
@@ -428,9 +418,10 @@ class DateCandidate:
             ctx.trace.skip(self.name, "KAKAO_REST_API_KEY 없음 — 장소를 지어내지 않고 미발동")
             return None
 
-        recent = recent_context(ctx.active)
-        memories = retrieve_many(recent, k=MEMORY_K, now=ctx.now, kinds=MEMORY_KINDS)
-        ctx.trace.date_memories = memories
+        # 기억 저장소는 파킹됐다 (2026-09-13, `parked/memory/`). 방이 여러 개가 되면서 전역
+        # 저장소가 다른 커플의 발화를 근거로 인용할 수 있어 일단 떼어냈다. 계획·문구는
+        # 현재 대화만 근거로 쓴다 — 프롬프트는 "기억 없음"을 원래부터 처리한다.
+        memories: list = []
 
         plan = date_course.plan_date(ctx.active, memories, gate)
         ctx.trace.date_plan = plan
@@ -515,9 +506,6 @@ class DateCandidate:
         if (asked := date_course.question_quote(reason_text)) is not None:
             ctx.trace.warn(self.name, f"인용에 묻는 말이 남음 — '{asked}'")
 
-        # 근거로 삼은 기억을 소모 처리한다. 같은 소재가 매번 다시 나오지 않게 한다.
-        if memories:
-            mark_used(memories[0].id, now=ctx.now, persist=ctx.persist)
         return result
 
 
@@ -703,33 +691,6 @@ def read_state(ctx: Context) -> list[EmotionAnalysis]:
     return clean
 
 
-def harvest_memories(ctx: Context) -> None:
-    """대화에서 기억을 뽑아 저장소에 넣는다.
-
-    **백그라운드로 돈다 — 응답을 기다리게 하지 않는다** (`run()` 상수 주석 ③). 이번 요청의
-    데이트 코스는 대화 원문을 프롬프트로 직접 받으므로 방금 "마라탕 땡긴다"고 한 발화는
-    저장소를 거치지 않아도 반영된다. 여기서 저장하는 것은 **다음 요청**을 위한 것이다.
-
-    **활성 세그먼트만 본다.** 화제가 섞인 덩어리에서 인용을 뽑으면 맥락이 어긋난 기억이
-    저장되고, 그게 나중에 추천 이유로 화면에 그대로 나간다. 과거 세그먼트는 이전 요청에서
-    이미 추출됐다.
-    """
-    try:
-        extracted = extract_memories(ctx.active)
-        ctx.trace.extracted = extracted
-        ctx.trace.saved = save_memories(extracted, persist=ctx.persist)
-    except Exception as exc:  # noqa: BLE001 — 추출 실패는 이번 요청의 결과를 바꾸지 않는다
-        # 예전에도 `run()` 이 이 future 의 결과를 안 읽어서 예외가 조용히 사라졌다.
-        # 백그라운드로 옮기면서 로그에라도 남긴다 — 응답은 이미 나간 뒤라 트레이스는 못 본다.
-        logging.getLogger("uvicorn.error").warning("기억 추출 실패 — %s", exc)
-
-
-# 응답 뒤에도 도는 작업용 풀. 기억 추출이 여기서 돈다 (`run()` 참조).
-# 4개면 충분하다 — 추출은 요청당 1회, 1~1.5초고, 다음 요청은 메시지 간격(수초~수분) 뒤에 온다.
-BACKGROUND_WORKERS = 4
-_background = ThreadPoolExecutor(max_workers=BACKGROUND_WORKERS, thread_name_prefix="kakapo-bg")
-
-
 def route(ctx: Context) -> list[AiResult]:
     """후보를 순서대로 돌린다. **`run()` 이 병렬로 도는 게 기본이고 이건 폴백이다.**
 
@@ -769,19 +730,17 @@ def route(ctx: Context) -> list[AiResult]:
 #     분절 ─┬─ 상태 산출                          │ (독립)
 #           ├─ 데이트 계획 → 카카오 → 데이트 문구   │ (독립)
 #           └─ 유튜브 (말투 결과를 본 뒤) ◀────────┘
-#     기억 추출 — 응답을 기다리게 하지 않는다 (백그라운드, 아래 ③)
+#     (기억 추출은 2026-09-13 저장소 파킹과 함께 빠졌다 — `parked/memory/`)
 #
 # **의존은 하나뿐이다.** 말투 → 유튜브 — `SUPPRESS_YOUTUBE_WHEN_TONE` 판단에 말투 결과가
 # 필요하다. 미리 돌려놓고 버리는 방법도 있지만 유튜브는 쿼터가 하루 95회라 버리는 호출을
 # 만들지 않는다.
 #
-# **기억 추출 → 데이트 의존은 끊었다.** 오래 "방금 한 발화가 같은 요청에 반영되어야 한다"는
-# 이유로 붙여뒀는데, 코드를 대조해 보니 **이미 만족하고 있었다** — `plan_date` 는
-# `format_transcript(messages)` 로 대화 원문을 통째로 받는다. "마라탕 땡긴다"는 프롬프트
-# 안에 그대로 있다. 기억 저장소를 거치는 것은 **과거 요청**에서 쌓인 기억을 찾기 위한
-# 경로고, 이번 요청의 발화는 거기 없어도 된다.
+# **데이트 계획은 대화 원문을 프롬프트로 직접 받는다** — `plan_date` 가
+# `format_transcript(messages)` 를 통째로 넣는다. "마라탕 땡긴다"는 프롬프트 안에 그대로
+# 있다. 기억 저장소가 없어도 이번 요청의 발화는 근거가 된다.
 #
-# ── 2026-09-13 레이턴시 리팩토링 — 세 가지가 더 붙었다. 결과 규칙은 하나도 안 바뀐다. ──
+# ── 2026-09-13 레이턴시 리팩토링 — 둘이 더 붙었다. 결과 규칙은 하나도 안 바뀐다. ──
 #
 # ⓪ **말투 후보는 분절을 기다리지 않는다 (선행 실행).** 분절이 맨 앞에 혼자 서서 모든
 #    단계가 기다리는 구조였는데, 말투 판정·생성이 보는 입력은 분절과 무관하다 —
@@ -801,12 +760,7 @@ def route(ctx: Context) -> list[AiResult]:
 # ① 분절 점수 캐시 (`segment.py`) — 여기가 아니라 분절 안이다. 같은 발화를 요청마다 다시
 #    채점하지 않아 분절이 창 30개에서 3~4초 → 새 발화 한두 개 채점 ~1초가 된다.
 #
-# ③ **기억 추출은 응답을 기다리게 하지 않는다.** 이번 요청의 결과에 쓰이지 않는다(위
-#    "의존을 끊었다" 참조) — 저장소에 넣는 것은 **다음 요청**을 위해서다. 그래서
-#    백그라운드 풀에 던지고 응답은 먼저 나간다. 다음 요청은 메시지 간격(수초~수분) 뒤라
-#    그때는 저장이 끝나 있다. CLI·devui 는 `analyze(wait_background=True)` 로 기다려서
-#    추출 결과를 그대로 보여준다. 응답 시간에서 빠지는 것은 "추출이 상태 산출보다 길었던
-#    만큼"(0~1초)이다.
+# (③ 기억 추출 백그라운드는 같은 날 저장소 파킹으로 사라졌다 — 추출 자체를 안 한다.)
 #
 # LLM·HTTP 대기가 전부라 스레드로 충분하다 (GIL 이 문제되지 않는다).
 # 동시에 던지는 작업 수. **5개까지 나갈 수 있다** — 상태 · 말투(선행) · 말투(재실행) ·
@@ -864,8 +818,6 @@ def run(ctx: Context) -> tuple[list[EmotionAnalysis], list[AiResult]]:
 
         f_state = pool.submit(read_state, ctx)
         f_date = pool.submit(_build, date, ctx)
-        # ③ 기억 추출 — 응답을 기다리게 하지 않는다 (상수 주석 참조)
-        ctx.trace.background.append(_background.submit(harvest_memories, ctx))
 
         # 유튜브는 말투 결과를 알아야 한다 (의존)
         tone_result = f_tone.result()

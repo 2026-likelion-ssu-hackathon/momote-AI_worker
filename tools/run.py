@@ -77,11 +77,6 @@ def _show_trace(trace: Trace) -> None:
             print(f"           · {sc.speaker}  {axes}   → {BOLD}{label}{OFF} {intensity:.0f}{mark}")
             print(f"             {DIM}{sc.note}{OFF}")
 
-    if trace.extracted:
-        print(f"  기억추출 {len(trace.extracted)}건 (신규 저장 {len(trace.saved)}건)")
-        for m in trace.extracted:
-            print(f'           · [{m.kind}] {m.content} ← "{m.source_quote}"')
-
     if (tg := trace.tone_gate) is not None and tg.triggered:
         print("  말투게이트")
         for f in tg.flags:
@@ -95,11 +90,6 @@ def _show_trace(trace: Trace) -> None:
 
     if (dg := trace.date_gate) is not None and dg.triggered:
         print(f"  데이트게이트 {dg.detail}")
-        if trace.date_memories:
-            print("  RAG 기억")
-            for m in trace.date_memories:
-                mark = " " if m.used_at is None else "*"
-                print(f"           {mark}[{m.kind}] {m.content}")
         if (dp := trace.date_plan) is not None:
             print(f"  데이트계획 should_recommend={dp.should_recommend} region={dp.region}")
             for label, _, qs in date_course.slot_queries(dp):
@@ -203,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="분절 점수, 게이트 판정, 검색된 기억, 외부 API 결과 표시")
     parser.add_argument("--no-persist", action="store_true",
-                        help="used_at / 기억 저장을 파일에 쓰지 않는다 (반복 시연용)")
+                        help="(기억 저장소 파킹 뒤로 효과 없음 — 호환용으로 남김)")
     parser.add_argument("--json", action="store_true",
                         help="규격서 응답 JSON 을 그대로 출력한다")
     args = parser.parse_args(argv)
@@ -213,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"파일 없음: {path}", file=sys.stderr)
             return 1
         payload = json.loads(path.read_text(encoding="utf-8"))
-        response, trace = analyze(payload, persist=not args.no_persist, wait_background=True)
+        response, trace = analyze(payload, persist=not args.no_persist)
 
         if args.json:
             print(json.dumps(response.to_json_dict(), ensure_ascii=False, indent=2))
