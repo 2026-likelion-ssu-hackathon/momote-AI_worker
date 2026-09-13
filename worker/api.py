@@ -29,7 +29,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -41,7 +40,6 @@ from starlette.concurrency import run_in_threadpool
 from worker import places, ytapi
 from worker.models import AnalysisRequest, AnalysisResponse
 from worker.pipeline import analyze
-from worker.retrieve import warm_index
 
 # 서버 쪽 요구는 "처리시간 30초 이내"다. 그보다 앞에서 우리가 끊는다 —
 # 백엔드가 커넥션을 자르면 남는 게 타임아웃 로그뿐이지만, 우리가 끊으면
@@ -51,9 +49,7 @@ from worker.retrieve import warm_index
 # 여기 걸리면 정상 지연이 아니라 OpenAI 쪽이 멈춘 것이다.
 ANALYSIS_DEADLINE = float(os.getenv("KAKAPO_DEADLINE", "25"))
 
-# 기억을 파일에 쓸지. 배포 환경의 파일시스템은 재배포하면 날아가므로 영속 저장이 아니다.
-# 그래도 켜 두는 이유는 **한 대화 안에서** 방금 추출한 기억이 다음 요청의 데이트 코스
-# 근거가 되기 때문이다. 반복 시연으로 결과를 고정하고 싶으면 `KAKAPO_PERSIST=0`.
+# 기억 저장소 파킹(2026-09-13, `parked/memory/`) 뒤로는 아무 효과가 없다. 인터페이스 호환용.
 PERSIST = os.getenv("KAKAPO_PERSIST", "1") not in {"0", "false", "False"}
 
 
@@ -73,10 +69,6 @@ async def lifespan(app: FastAPI):
         ytapi.available(),
     )
 
-    # 기억 인덱스를 미리 만든다. 27건 임베딩에 2.6초가 걸리는데, 안 하면 그게
-    # **첫 요청의 데이트 코스 경로 한가운데** 얹힌다. 결과는 바뀌지 않고 시점만 앞당긴다.
-    # 실패해도 넘어간다 — 뒤에서 `_get_store()` 가 다시 시도한다.
-    threading.Thread(target=warm_index, daemon=True).start()
     yield
 
 
@@ -151,6 +143,7 @@ def _log_outcome(
     result_types: list[str] | None = None,
     state_count: int = 0,
     skipped: list[tuple[str, str]] | None = None,
+    segment_cache: tuple[int, int] | None = None,
 ) -> None:
     """요청 하나의 결과를 한 줄로 남긴다.
 
@@ -171,6 +164,10 @@ def _log_outcome(
     # 단, 쿼터 소진은 여기에도 안 남는다 — 검색이 0건으로 돌아올 뿐이다 (demo-checklist 6장).
     if skipped:
         tail += " · 보류=" + "; ".join(f"{name}:{reason}" for name, reason in skipped)
+    # 분절 점수 캐시 적중. "캐시 N/M" = 채점 대상 M개 중 N개를 캐시에서 가져왔다.
+    # 방의 첫 요청은 0/M, 그 뒤는 (M-1)/M 이어야 정상이다 — 계속 0 이면 캐시가 안 맞는 것.
+    if segment_cache is not None and sum(segment_cache) > 0:
+        tail += f" · 분절캐시={segment_cache[0]}/{sum(segment_cache)}"
     logging.getLogger("uvicorn.error").info(
         "분석 %s · %.1f초 · %s · %s", request_id or "(id 없음)", seconds, status, tail
     )
@@ -214,6 +211,7 @@ async def chat_analyses(request: AnalysisRequest) -> JSONResponse:
         [r.result_type for r in response.results],
         len(response.emotion_analyses),
         trace.skipped,
+        (trace.segment_cached, trace.segment_scored),
     )
     return JSONResponse(response.to_json_dict())
 

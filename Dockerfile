@@ -1,9 +1,8 @@
 # kakapo AI 워커 — 배포 이미지.
 #
 # 런타임에 필요한 것만 넣는다. 평가셋(`data/eval/`, 136MB)·픽스처·개발 도구는 뺀다.
-# 시드 두 개(`memories.json` · `speaker_profiles.json`)는 **판정에 쓰이므로 필수다** —
-# 기억이 0건이면 데이트 코스가 근거를 못 만들고, 말투 기준선이 없으면 교정이 절대 기준으로
-# 판정하게 된다.
+# `yt_seed.json` 은 유튜브 API 가 죽었을 때의 폴백이라 필수다. 기억 시드·말투 기준선 시드는
+# 2026-09-13 에 뺐다 (`parked/`) — 말투 기준선은 코드 안의 공통값(`profile.GENERIC_PROFILE`)이다.
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -16,7 +15,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY worker/ worker/
-COPY data/memories.json data/speaker_profiles.json data/yt_seed.json data/
+COPY data/yt_seed.json data/
 
 # `uvicorn` CLI 를 직접 부르지 않는다. `worker/api.py` 의 `main()` 이 IPv4·IPv6 를
 # 같이 받는 듀얼스택 소켓을 만들어 넘기기 때문이다 — Railway 의 프로젝트 내부 통신은

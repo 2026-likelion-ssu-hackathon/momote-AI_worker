@@ -44,7 +44,7 @@ cp .env.example .env      # OPENAI_API_KEY 채우기 (나머지는 선택)
 | 옵션 | 설명 |
 | --- | --- |
 | `--verbose` `-v` | 분절 점수, 게이트 판정, 검색된 기억, 외부 API 결과 표시 |
-| `--no-persist` | `used_at`·기억 저장을 파일에 쓰지 않는다 (**반복 시연용**) |
+| `--no-persist` | (기억 저장소 파킹 뒤로 효과 없음 — 호환용) |
 | `--json` | 백엔드에 나가는 규격서 응답을 그대로 출력 |
 
 여러 개를 한 번에 돌릴 수 있다: `.venv/bin/python -m tools.run fixtures/*.json --no-persist`
@@ -100,6 +100,9 @@ CLI 와 **같은 진입점**(`worker.pipeline.analyze`)을 부르는 로컬 확�
 | `OPENAI_API_KEY` | 전부 | 동작 불가 |
 | `KAKAO_REST_API_KEY` | 데이트 코스 | 미발동 |
 | `YOUTUBE_API_KEY` | 유튜브 추천 | 미발동 |
+
+레이턴시 손잡이(`KAKAPO_SEGMENT_CACHE` · `KAKAPO_LLM_TIMEOUT` · `KAKAPO_SERVICE_TIER`)는
+`.env.example` 과 [`docs/refactoring.md`](docs/refactoring.md) 에 있다.
 
 ---
 
@@ -458,7 +461,6 @@ LLM 이 시간대를 판단할 수 있다 — 데이트 코스가 "밤 10시에 
 | 파일 | 내용 |
 | --- | --- |
 | `data/memories.json` | 기억 시드 27건. 실행 중 추출된 기억이 여기 append 된다 |
-| `data/speaker_profiles.json` | A·B 말투 기준선 시드 |
 | `data/eval/msd_sample.jsonl` | 실제 한국어 멀티세션 대화 2000건 (평가용). 원본 parquet 는 깃에 없다 |
 
 ### 지금은 안 불리는 것
@@ -493,7 +495,7 @@ LLM 호출을 둘로 나눈 이유: 최대 리스크는 **장난을 갈등으로
 
 **개인별 평소 말투 기준선이 핵심이다.** 특정 단어를 절대 기준으로 잡지 않고
 그 사람의 평소 대비 변화량으로 판정한다 — 마침표율, 호칭, 평균 길이, ㅋ 개수, 이모지 빈도.
-시드는 `data/speaker_profiles.json`, 계산은 `profile.py`.
+기준선은 `profile.py` 의 `GENERIC_PROFILE`(공통값) — 요청의 `speakerProfiles` 가 오면 그쪽이 우선.
 
 `abrupt_change`(평소 대비 급변)는 **약한 증거다.** 다른 신호와 함께일 때만 세고,
 혼자서는 하위 신호 2개 이상일 때만 인정한다. 이 제한이 없으면 평범한 단답이 전부 걸린다.

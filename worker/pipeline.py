@@ -4,8 +4,9 @@
 
     AnalysisRequest → [대화 분절] → [기억 수확 · 실 상태 · 후보 3종] → AnalysisResponse
 
-분절만 반드시 먼저 돌고, 그 뒤는 `router.run()` 이 **독립인 것을 동시에** 돌린다.
-의존 두 개(기억 추출 → 데이트, 말투 → 유튜브)는 그대로 지킨다.
+`router.run()` 이 분절부터 **독립인 것을 동시에** 돌린다 — 말투 후보는 분절도 안 기다리고
+먼저 출발한다(입력이 분절과 무관해서). 의존은 말투 → 유튜브 하나다.
+(기억 저장소·추출은 2026-09-13 파킹 — `parked/memory/`.)
 
 위젯은 두 줄이고 응답의 배열도 두 개다. ①번 줄(상시) = `emotionAnalyses`,
 ②번 줄(3종 개입, 미발동이면 빈 줄) = `results`. 서로 밀어내지 않는다.
@@ -25,14 +26,11 @@
 
 from __future__ import annotations
 
-import threading
-
 from pydantic import ValidationError
 
 from worker.llm import SLOW_CALL_SECONDS, USAGE
 from worker.models import AnalysisRequest, AnalysisResponse
-from worker.retrieve import warm_index
-from worker.router import Context, Trace, run, split
+from worker.router import Context, Trace, run
 
 __all__ = ["Context", "Trace", "analyze"]
 
@@ -42,6 +40,9 @@ def analyze(payload: dict, persist: bool = True) -> tuple[AnalysisResponse, Trac
 
     예외를 밖으로 던지지 않는다. 규격서 12장의 `FAILED` 응답으로 바꿔서 돌려준다 —
     워커가 죽으면 채팅 서버가 타임아웃까지 기다리게 된다.
+
+    `persist` 는 기억 저장소 파킹(2026-09-13) 뒤로 아무것도 하지 않는다 — CLI `--no-persist`,
+    `KAKAPO_PERSIST` 와의 인터페이스 호환으로만 남겨 둔다.
     """
     trace = Trace()
 
@@ -73,16 +74,10 @@ def analyze(payload: dict, persist: bool = True) -> tuple[AnalysisResponse, Trac
         trace=trace,
     )
 
-    # 기억 인덱스를 미리 만든다. 분절 LLM 호출이 도는 동안은 어차피 기다리는 시간이라
-    # 거기 겹친다 — 안 그러면 첫 요청의 데이트 코스 경로 한가운데서 2.6초를 쓴다.
-    # 데몬 스레드라 결과를 기다리지 않고, 뒤에서 `_get_store()` 가 같은 락을 잡는다.
-    threading.Thread(target=warm_index, daemon=True).start()
-
     # 이번 요청에서 난 LLM 호출만 보려고 위치를 잡아둔다 (USAGE 는 프로세스 전역 누적).
     mark = len(USAGE.records)
 
     try:
-        split(ctx)
         states, results = run(ctx)
     except Exception as exc:  # noqa: BLE001
         return _failed(request.analysis_request_id, "MODEL_ERROR", str(exc)), trace
