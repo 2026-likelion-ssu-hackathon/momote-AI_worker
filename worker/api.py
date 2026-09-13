@@ -151,6 +151,7 @@ def _log_outcome(
     result_types: list[str] | None = None,
     state_count: int = 0,
     skipped: list[tuple[str, str]] | None = None,
+    segment_cache: tuple[int, int] | None = None,
 ) -> None:
     """요청 하나의 결과를 한 줄로 남긴다.
 
@@ -171,6 +172,10 @@ def _log_outcome(
     # 단, 쿼터 소진은 여기에도 안 남는다 — 검색이 0건으로 돌아올 뿐이다 (demo-checklist 6장).
     if skipped:
         tail += " · 보류=" + "; ".join(f"{name}:{reason}" for name, reason in skipped)
+    # 분절 점수 캐시 적중. "캐시 N/M" = 채점 대상 M개 중 N개를 캐시에서 가져왔다.
+    # 방의 첫 요청은 0/M, 그 뒤는 (M-1)/M 이어야 정상이다 — 계속 0 이면 캐시가 안 맞는 것.
+    if segment_cache is not None and sum(segment_cache) > 0:
+        tail += f" · 분절캐시={segment_cache[0]}/{sum(segment_cache)}"
     logging.getLogger("uvicorn.error").info(
         "분석 %s · %.1f초 · %s · %s", request_id or "(id 없음)", seconds, status, tail
     )
@@ -214,6 +219,7 @@ async def chat_analyses(request: AnalysisRequest) -> JSONResponse:
         [r.result_type for r in response.results],
         len(response.emotion_analyses),
         trace.skipped,
+        (trace.segment_cached, trace.segment_scored),
     )
     return JSONResponse(response.to_json_dict())
 

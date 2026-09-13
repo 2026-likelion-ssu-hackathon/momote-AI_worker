@@ -53,12 +53,38 @@ STAGE_MODEL: dict[str, str] = {}
 SLOW_CALL_SECONDS = 6.0
 
 
+# 호출 하나의 HTTP 타임아웃(초). **없으면 OpenAI SDK 기본값 600초다** — 연결이 멎으면
+# 워커 마감(25초)까지 기다렸다가 요청 전체가 `ANALYSIS_TIMEOUT` 이 된다. 여기서 먼저
+# 끊으면 그 단계만 자기 폴백(분절 → 안 자름, 상태 → 갱신 없음, 후보 → 미발동)으로
+# 떨어지고 나머지는 산다. 정상 호출은 1~4초라 15초는 재시도 백오프까지 넉넉하다.
+LLM_TIMEOUT = float(os.getenv("KAKAPO_LLM_TIMEOUT", "15"))
+
+# OpenAI 처리 우선순위. 비우면 기본(auto). `priority` 는 지연이 줄지만 토큰 단가가
+# 오른다 — 시연·피크 시간에만 켜는 손잡이로 둔다 (`docs/refactoring.md`).
+SERVICE_TIER = os.getenv("KAKAPO_SERVICE_TIER", "").strip() or None
+
+
 @lru_cache(maxsize=8)
 def _model(with_temperature: bool, name: str):
+    kwargs: dict = {"timeout": LLM_TIMEOUT}
+    if SERVICE_TIER:
+        kwargs["service_tier"] = SERVICE_TIER
     raw = os.getenv("KAKAPO_TEMPERATURE", "0.3").strip()
     if with_temperature and raw:
-        return init_chat_model(name, temperature=float(raw))
-    return init_chat_model(name)
+        kwargs["temperature"] = float(raw)
+    return init_chat_model(name, **kwargs)
+
+
+@lru_cache(maxsize=64)
+def _structured(schema: type, with_temperature: bool, name: str):
+    """스키마별 구조화 출력 러너블. **호출마다 다시 만들지 않는다.**
+
+    `with_structured_output` 은 부를 때마다 pydantic 에서 JSON 스키마를 뽑고 러너블을
+    새로 엮는다 — 단계 7종 × 요청마다 반복되는 순수 CPU 낭비라 한 번만 만든다.
+    """
+    return _model(with_temperature, name).with_structured_output(
+        schema, method="json_schema", strict=True, include_raw=True
+    )
 
 
 @lru_cache(maxsize=32)
@@ -135,9 +161,7 @@ def ask(schema: type[T], system: str, user: str) -> T:
     # 기본 모델은 환경변수로, 단계별 예외는 `STAGE_MODEL` 로 정한다.
     name = STAGE_MODEL.get(schema.__name__) or os.getenv("KAKAPO_MODEL", DEFAULT_MODEL)
     for with_temperature in (True, False):
-        model = _model(with_temperature, name).with_structured_output(
-            schema, method="json_schema", strict=True, include_raw=True
-        )
+        model = _structured(schema, with_temperature, name)
         started = time.perf_counter()
         try:
             result = model.invoke(messages)

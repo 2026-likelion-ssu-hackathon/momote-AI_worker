@@ -4,8 +4,9 @@
 
     AnalysisRequest → [대화 분절] → [기억 수확 · 실 상태 · 후보 3종] → AnalysisResponse
 
-분절만 반드시 먼저 돌고, 그 뒤는 `router.run()` 이 **독립인 것을 동시에** 돌린다.
-의존 두 개(기억 추출 → 데이트, 말투 → 유튜브)는 그대로 지킨다.
+`router.run()` 이 분절부터 **독립인 것을 동시에** 돌린다 — 말투 후보는 분절도 안 기다리고
+먼저 출발한다(입력이 분절과 무관해서). 의존은 말투 → 유튜브 하나다.
+기억 추출은 응답을 기다리게 하지 않고 뒤에서 돈다 (`router.run` 주석 ③).
 
 위젯은 두 줄이고 응답의 배열도 두 개다. ①번 줄(상시) = `emotionAnalyses`,
 ②번 줄(3종 개입, 미발동이면 빈 줄) = `results`. 서로 밀어내지 않는다.
@@ -32,16 +33,21 @@ from pydantic import ValidationError
 from worker.llm import SLOW_CALL_SECONDS, USAGE
 from worker.models import AnalysisRequest, AnalysisResponse
 from worker.retrieve import warm_index
-from worker.router import Context, Trace, run, split
+from worker.router import Context, Trace, run
 
 __all__ = ["Context", "Trace", "analyze"]
 
 
-def analyze(payload: dict, persist: bool = True) -> tuple[AnalysisResponse, Trace]:
+def analyze(
+    payload: dict, persist: bool = True, wait_background: bool = False
+) -> tuple[AnalysisResponse, Trace]:
     """규격서 요청 JSON 을 받아 응답을 만든다.
 
     예외를 밖으로 던지지 않는다. 규격서 12장의 `FAILED` 응답으로 바꿔서 돌려준다 —
     워커가 죽으면 채팅 서버가 타임아웃까지 기다리게 된다.
+
+    `wait_background=True` 면 응답 뒤에 도는 작업(기억 추출)까지 기다린다 — CLI·devui 가
+    `trace.extracted` 를 보여주려고 쓴다. **서버는 기다리지 않는다** (기본값).
     """
     trace = Trace()
 
@@ -82,10 +88,13 @@ def analyze(payload: dict, persist: bool = True) -> tuple[AnalysisResponse, Trac
     mark = len(USAGE.records)
 
     try:
-        split(ctx)
         states, results = run(ctx)
     except Exception as exc:  # noqa: BLE001
         return _failed(request.analysis_request_id, "MODEL_ERROR", str(exc)), trace
+
+    if wait_background:
+        for future in trace.background:
+            future.result()
 
     # 비정상적으로 느린 호출을 남긴다. **판정을 바꾸지 않는다** — 왜 느렸는지 되짚을
     # 단서만 만든다. 뺄셈이라 비용이 없다 (`llm.SLOW_CALL_SECONDS` 주석 참조).

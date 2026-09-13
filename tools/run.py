@@ -41,7 +41,11 @@ CANDIDATE_LABEL = {
 
 def _show_trace(trace: Trace) -> None:
     if trace.segments:
-        print(f"  대화분절 {len(trace.segments)}개  {DIM}(마지막이 활성 세그먼트){OFF}")
+        cache = ""
+        if trace.segment_cached or trace.segment_scored:
+            cache = (f" · 점수 캐시 {trace.segment_cached}/"
+                     f"{trace.segment_cached + trace.segment_scored}")
+        print(f"  대화분절 {len(trace.segments)}개  {DIM}(마지막이 활성 세그먼트{cache}){OFF}")
         for i, seg in enumerate(trace.segments):
             head = "→" if i == len(trace.segments) - 1 else " "
             how = "룰컷" if seg.by_rule else "채점"
@@ -209,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"파일 없음: {path}", file=sys.stderr)
             return 1
         payload = json.loads(path.read_text(encoding="utf-8"))
-        response, trace = analyze(payload, persist=not args.no_persist)
+        response, trace = analyze(payload, persist=not args.no_persist, wait_background=True)
 
         if args.json:
             print(json.dumps(response.to_json_dict(), ensure_ascii=False, indent=2))

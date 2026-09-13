@@ -101,6 +101,9 @@ CLI 와 **같은 진입점**(`worker.pipeline.analyze`)을 부르는 로컬 확�
 | `KAKAO_REST_API_KEY` | 데이트 코스 | 미발동 |
 | `YOUTUBE_API_KEY` | 유튜브 추천 | 미발동 |
 
+레이턴시 손잡이(`KAKAPO_SEGMENT_CACHE` · `KAKAPO_LLM_TIMEOUT` · `KAKAPO_SERVICE_TIER`)는
+`.env.example` 과 [`docs/refactoring.md`](docs/refactoring.md) 에 있다.
+
 ---
 
 ## 절대 제약

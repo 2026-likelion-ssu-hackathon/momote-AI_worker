@@ -177,7 +177,7 @@ def _run(payload: dict, persist: bool) -> dict:
     with _LOCK:
         mark = len(USAGE.records)
         started = time.perf_counter()
-        response, trace = analyze(payload, persist=persist)
+        response, trace = analyze(payload, persist=persist, wait_background=True)
         elapsed = time.perf_counter() - started
         # 이번 요청에서 난 호출만 잘라낸다. USAGE 는 프로세스 전역 누적이다.
         records = USAGE.records[mark:]

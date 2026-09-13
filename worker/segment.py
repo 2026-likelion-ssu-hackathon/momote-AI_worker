@@ -24,6 +24,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -31,7 +35,7 @@ from datetime import timedelta
 from worker.llm import ask, load_prompt
 from worker.models import Message, Segment, SegmentLLMOutput, SegmentScore
 
-__all__ = ["SegmentResult", "segment", "active_context"]
+__all__ = ["SegmentResult", "segment", "active_context", "rule_tail", "clear_score_cache"]
 
 # ① 룰 컷 — 이 이상 침묵하면 채점하지 않고 자른다.
 #
@@ -70,10 +74,16 @@ CONTEXT_MIN = 4
 
 @dataclass
 class SegmentResult:
-    """분절 결과. `scores` 는 트레이스용이고 판정에는 이미 반영돼 있다."""
+    """분절 결과. `scores` 는 트레이스용이고 판정에는 이미 반영돼 있다.
+
+    `cached` / `scored` 는 점수 캐시 계측이다 — 채점 대상 중 몇 개를 캐시에서 가져왔고
+    몇 개를 LLM 에 물었는지. 판정에는 관여하지 않고 로그·트레이스에만 쓴다.
+    """
 
     segments: list[Segment] = field(default_factory=list)
     scores: list[SegmentScore] = field(default_factory=list)
+    cached: int = 0
+    scored: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -91,6 +101,18 @@ def _rule_cut(messages: list[Message]) -> list[list[Message]]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def rule_tail(messages: list[Message]) -> list[Message]:
+    """룰 컷만 적용했을 때의 마지막 조각. **LLM 없이 즉시 나온다.**
+
+    활성 세그먼트는 언제나 이 조각의 꼬리(부분집합)다. 분절 LLM 을 기다리지 않고
+    먼저 시작할 수 있는 단계(말투 선행 실행, `router.run`)가 이걸 본다.
+    """
+    if not messages:
+        return []
+    ordered = sorted(messages, key=lambda m: (m.sent_at, m.message_id))
+    return _rule_cut(ordered)[-1]
 
 
 # --------------------------------------------------------------------------
@@ -124,7 +146,80 @@ def _transcript(context: list[Message], targets: list[Message]) -> str:
 # 생산 창(메시지 30개)을 한 호출로 채점하면 출력 ~470토큰에 7~8초다.
 # 넘으면 배치로 나눠 **동시에** 부른다. 각 배치 호출은 자기 앞의 전체 맥락을 '앞 맥락'
 # 구획으로 그대로 보므로 **판단 재료는 한 호출일 때와 같다** — 출력만 나뉜다.
+#
+# ⚠️ **10 으로 줄여봤다가 되돌렸다** (2026-09-13). 벽시계는 가장 큰 배치의 출력 길이가
+# 정하니 줄이면 빨라지는데(창 25개 1.9초 → 1.5초), 캐시 끄고 3회씩 재보니 **배치가 작으면
+# 경계를 잃는다** — case19(싸움 → 화해) [10,4] → [14] 3/3, case21 [13,2,4,4,3] → 4·4 가
+# 8 로 합쳐짐 3/3. 채점 대상이 짧으면 모델이 낮은 점수를 안 준다. 15 는 그 경계가 유지되는
+# 검증된 값이다. 아래 점수 캐시가 붙은 뒤로 이 값은 **방의 첫 요청(콜드)** 에서만
+# 의미가 있다 — 그 뒤로는 새 발화 한두 개만 채점해서 배치가 하나다.
 SCORE_BATCH = 15
+
+# --------------------------------------------------------------------------
+# 점수 캐시 — 같은 발화를 요청마다 다시 채점하지 않는다 (2026-09-13)
+# --------------------------------------------------------------------------
+# 백엔드는 **메시지 1건마다** 최근 창 30개를 통째로 보낸다. 요청 N 이 발화 1~30 을
+# 채점했으면 요청 N+1 (발화 2~31) 에서 새로 온 것은 31 하나인데, 지금까지는 30개를
+# 매번 다시 채점했다 — 분절이 맨 앞에 혼자 서서 모든 단계가 기다리는 자리라 그 시간이
+# 요청마다 고스란히 붙었다 (창 30개 = 3~4초).
+#
+# 발화 하나의 점수는 "직전까지의 맥락과 얼마나 이어지는가"라 **같은 발화·같은 직전
+# 발화면 재료가 같다.** 그래서 (방, 발화 id) 로 점수를 기억해 두고, 캐시에 없는 발화
+# — 대개 마지막 한두 개 — 만 그 앞 전체를 '앞 맥락' 구획으로 붙여 채점한다. 판단
+# 재료는 분할 채점과 똑같고(각 발화는 자기 앞 전체를 본다) 출력만 준다.
+#
+# **워커 무상태 원칙과의 관계.** 이건 상태가 아니라 메모다 — 없으면 전부 다시
+# 채점하고 결과 규칙은 하나도 안 바뀐다. 프로세스가 재시작되면 비고, 다른 인스턴스와
+# 공유하지 않는다. 부수 효과가 하나 있는데 **좋은 쪽이다**: 같은 발화의 점수가 요청마다
+# 흔들리지 않아 세그먼트 경계가 안정된다 — 유튜브·데이트의 "같은 화제엔 하나만" 억제가
+# 세그먼트 시작 시각에 기대고 있어서, 경계가 흔들리면 억제가 새던 자리다.
+#
+# **키에 내용 지문을 넣는다.** 픽스처는 전부 `chatRoomId=1` 에 id 101~ 이 겹치고,
+# 방 id 를 서버가 재사용할 수도 있다. (직전 발화 id·내용, 이 발화 id·내용) 의 해시가
+# 다르면 다른 발화로 본다 — 같은 방·같은 id 라도 내용이 바뀌면 캐시가 안 맞는다.
+#
+# 크기는 LRU 로 묶는다. 항목 하나가 수십 바이트라 4,000개면 방 130개 × 창 30개다.
+# `KAKAPO_SEGMENT_CACHE=0` 이면 끈다 (회귀 비교·벤치용).
+SCORE_CACHE_MAX = int(os.getenv("KAKAPO_SEGMENT_CACHE", "4000"))
+
+# 캐시가 다 맞아도 **마지막 이 개수는 다시 채점한다.**
+#
+# 새 발화 하나만 채점 대상으로 주면 모델이 관대해진다 — case2(2개짜리 소화제 4개)를
+# 메시지 하나씩 늘려가며 돌리면 콜드 [2,2,2,2] 6/6 이 증분에서는 [2,4,2]·[2,6] 으로
+# 3/4 무너졌다. 채점 대상이 몇 개 이어져야 앞뒤를 견주어 낮은 점수를 준다. 값은 아래
+# 실측으로 정했다 (`docs/refactoring.md`). 출력은 발화당 ~11토큰이라 비용은 거의 없다.
+SCORE_TAIL_MIN = int(os.getenv("KAKAPO_SEGMENT_TAIL", "3"))
+
+_score_cache: OrderedDict[tuple[str, int], tuple[str, SegmentScore]] = OrderedDict()
+_score_cache_lock = threading.Lock()
+
+
+def _fingerprint(prev: Message, cur: Message) -> str:
+    raw = f"{prev.message_id}\x1f{prev.content}\x1f{cur.message_id}\x1f{cur.content}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_get(room: str, message_id: int, fingerprint: str) -> SegmentScore | None:
+    with _score_cache_lock:
+        hit = _score_cache.get((room, message_id))
+        if hit is None or hit[0] != fingerprint:
+            return None
+        _score_cache.move_to_end((room, message_id))
+        return hit[1]
+
+
+def _cache_put(room: str, message_id: int, fingerprint: str, score: SegmentScore) -> None:
+    with _score_cache_lock:
+        _score_cache[(room, message_id)] = (fingerprint, score)
+        _score_cache.move_to_end((room, message_id))
+        while len(_score_cache) > SCORE_CACHE_MAX:
+            _score_cache.popitem(last=False)
+
+
+def clear_score_cache() -> None:
+    """테스트·벤치용 — 캐시를 비운다."""
+    with _score_cache_lock:
+        _score_cache.clear()
 
 
 def _ask_scores(context: list[Message], targets: list[Message]) -> list[SegmentScore]:
@@ -132,8 +227,10 @@ def _ask_scores(context: list[Message], targets: list[Message]) -> list[SegmentS
     return out.scores
 
 
-def _score(chunk: list[Message]) -> list[SegmentScore] | None:
-    """발화별 연속성 점수. 호출 전부가 실패하면 None → 자르지 않는다.
+def _score(
+    chunk: list[Message], cache_key: str | None = None
+) -> tuple[list[SegmentScore] | None, int, int]:
+    """발화별 연속성 점수 + (캐시 적중 수, LLM 채점 수). 호출 전부가 실패하면 None → 자르지 않는다.
 
     **점수가 빠지거나 엉뚱한 id 가 섞여도 통째로 버리지 않는다.** 아는 id 만 남기고
     나머지는 없는 대로 둔다 — 빠진 발화는 `_cut_by_score()` 에서 "안 자름"으로 처리된다.
@@ -142,23 +239,49 @@ def _score(chunk: list[Message]) -> list[SegmentScore] | None:
     전량 대조로 하면 실패 반경이 너무 크다. 점수 하나가 어긋났다고 조각 전체를 세그먼트
     1개로 되돌리면 **길게 나눠 놨던 경계가 통째로 사라진다.** 대화가 길수록 어긋날 확률은
     올라가는데 잃는 것도 같이 커진다 — 가장 나쁜 조합이다.
+
+    **캐시 (`cache_key` 가 있을 때).** 앞에서부터 캐시에 있는 발화는 그 점수를 쓰고,
+    **첫 미적중부터 끝까지**를 채점 대상으로 삼는다 — 그 앞 전체가 '앞 맥락' 구획이다.
+    미적중이 중간에 끼면 그 뒤의 적중분도 같이 다시 채점한다 (채점 대상은 언제나 꼬리
+    하나로 이어져야 배치 형식이 그대로다). 새로 받은 점수는 캐시에 넣는다.
     """
     to_score = chunk[1:]  # 첫 발화는 비교할 앞이 없다
     if not to_score:
-        return None
-    n_batches = -(-len(to_score) // SCORE_BATCH)
-    size = -(-len(to_score) // n_batches)
+        return None, 0, 0
+
+    use_cache = cache_key is not None and SCORE_CACHE_MAX > 0
+    prints: dict[int, str] = {}
+    cached: dict[int, SegmentScore] = {}
+    if use_cache:
+        for prev, cur in zip(chunk, to_score):
+            prints[cur.message_id] = _fingerprint(prev, cur)
+            hit = _cache_get(cache_key, cur.message_id, prints[cur.message_id])  # type: ignore[arg-type]
+            if hit is not None:
+                cached[cur.message_id] = hit
+
+    first_miss = next(
+        (i for i, m in enumerate(to_score) if m.message_id not in cached), len(to_score)
+    )
+    # 꼬리는 캐시가 있어도 다시 채점한다 (SCORE_TAIL_MIN 주석 참조).
+    first_miss = min(first_miss, max(0, len(to_score) - SCORE_TAIL_MIN))
+    reused = to_score[:first_miss]
+    scores: list[SegmentScore] = [cached[m.message_id] for m in reused]
+
+    targets = to_score[first_miss:]
+    n_batches = -(-len(targets) // SCORE_BATCH)
+    size = -(-len(targets) // n_batches)
 
     raw: list[SegmentScore] = []
-    if n_batches == 1:
+    if n_batches == 1 and first_miss == 0:
+        # 캐시 적중이 없고 배치도 하나면 예전 그대로의 단일 형식이다.
         try:
             raw = _ask_scores([], chunk)
         except Exception:  # noqa: BLE001 — 채점 실패는 오류가 아니라 '안 나눔'이다
-            return None
+            return (scores or None), len(scores), len(targets)
     else:
         jobs = [
-            (chunk[: 1 + i], to_score[i : i + size])
-            for i in range(0, len(to_score), size)
+            (chunk[: 1 + first_miss + i], targets[i : i + size])
+            for i in range(0, len(targets), size)
         ]
         with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
             futures = [pool.submit(_ask_scores, ctx, tgt) for ctx, tgt in jobs]
@@ -168,14 +291,15 @@ def _score(chunk: list[Message]) -> list[SegmentScore] | None:
                 except Exception:  # noqa: BLE001 — 이 배치만 '안 자름'이 된다
                     continue
 
-    known = {m.message_id for m in chunk[1:]}
+    known = {m.message_id for m in targets}
     seen: set[int] = set()
-    scores: list[SegmentScore] = []
     for s in raw:
         if s.id in known and s.id not in seen:
             seen.add(s.id)
             scores.append(s)
-    return scores or None
+            if use_cache:
+                _cache_put(cache_key, s.id, prints[s.id], s)  # type: ignore[arg-type]
+    return (scores or None), len(reused), len(targets)
 
 
 # --------------------------------------------------------------------------
@@ -234,8 +358,11 @@ def _whole(messages: list[Message]) -> list[Segment]:
     return [Segment(messages=messages, by_rule=True)] if messages else []
 
 
-def segment(messages: list[Message]) -> SegmentResult:
-    """스트림을 세그먼트 목록으로. 마지막 원소가 **활성 세그먼트**다."""
+def segment(messages: list[Message], cache_key: str | None = None) -> SegmentResult:
+    """스트림을 세그먼트 목록으로. 마지막 원소가 **활성 세그먼트**다.
+
+    `cache_key` 는 점수 캐시의 방 식별자다 (보통 `chatRoomId`). None 이면 캐시를 안 쓴다.
+    """
     if not messages:
         return SegmentResult()
 
@@ -250,12 +377,15 @@ def segment(messages: list[Message]) -> SegmentResult:
     if len(last) < MIN_FOR_LLM:
         return SegmentResult(segments=segments + _whole(last))
 
-    scores = _score(last)
+    scores, cached, scored = _score(last, cache_key)
     if scores is None:
         # 폴백 = 점수 전부 100 = 안 자름 = 분절 전 동작. 더 나빠지지 않는다.
-        return SegmentResult(segments=segments + _whole(last))
+        return SegmentResult(segments=segments + _whole(last), cached=cached, scored=scored)
 
-    return SegmentResult(segments=segments + _cut_by_score(last, scores), scores=scores)
+    return SegmentResult(
+        segments=segments + _cut_by_score(last, scores),
+        scores=scores, cached=cached, scored=scored,
+    )
 
 
 def active_context(segments: list[Segment]) -> list[Message]:

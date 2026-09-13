@@ -31,8 +31,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
@@ -65,7 +66,7 @@ from worker.models import (
 from worker.places import KakaoPlace
 from worker.profile import resolve_profile
 from worker.retrieve import mark_used, recent_context, retrieve_many, save_memories
-from worker.segment import active_context, segment
+from worker.segment import active_context, rule_tail, segment
 from worker.tone import (
     check_tone_gate,
     harsh_in,
@@ -164,6 +165,10 @@ class Trace:
         # 대화 분절
         self.segments: list[Segment] = []
         self.scores: list[SegmentScore] = []  # 발화별 연속성 점수 (왜 잘렸는지)
+        self.segment_cached = 0   # 점수 캐시에서 가져온 발화 수
+        self.segment_scored = 0   # LLM 에 물은 발화 수
+        # 응답 뒤에도 도는 작업 (기억 추출). CLI·devui 는 기다려서 보여주고 서버는 안 기다린다.
+        self.background: list[Future] = []
         # 기억
         self.extracted: list[Memory] = []
         self.saved: list[Memory] = []
@@ -189,6 +194,13 @@ class Trace:
 
     def warn(self, name: str, note: str) -> None:
         self.warnings.append((name, note))
+
+    def absorb_tone(self, other: "Trace") -> None:
+        """선행 실행한 말투 후보의 기록을 받아들인다 (`run()` 의 선행 실행 참조)."""
+        self.tone_gate = other.tone_gate
+        self.tone_judged = other.tone_judged
+        self.skipped.extend(other.skipped)
+        self.warnings.extend(other.warnings)
 
 
 @dataclass
@@ -247,7 +259,7 @@ class Candidate(Protocol):
         ...
 
 
-def _fit(ctx: Context, name: str, result: AiResult, regenerate) -> AiResult:
+def _fit(ctx: Context, name: str, result: AiResult, regenerate, trace: Trace | None = None) -> AiResult:
     """화면 글자 수 한도를 지킨다 — **1회 재생성, 그래도 넘으면 절단.**
 
     금지어 필터와 같은 구조인데 **마지막 처리가 다르다.** 금지어는 절대 제약이라 못 지키면
@@ -256,19 +268,20 @@ def _fit(ctx: Context, name: str, result: AiResult, regenerate) -> AiResult:
     프롬프트에 자수를 적어두는 것만으로는 안 지켜진다 — 실측에서 넘는 출력이 계속 나왔다
     (`worker/limits.py`).
     """
+    trace = trace or ctx.trace
     hit = over_limit(result)
     if hit is None:
         return result
 
     field, actual, limit = hit
-    ctx.trace.skip(name, f"글자 수 초과 — {field} {actual}자 > {limit}자, 재생성")
+    trace.skip(name, f"글자 수 초과 — {field} {actual}자 > {limit}자, 재생성")
 
     retry = regenerate()
     if over_limit(retry) is None:
         return retry
 
     field, actual, limit = over_limit(retry)  # type: ignore[misc]
-    ctx.trace.skip(name, f"재생성도 초과 — {field} {actual}자 > {limit}자, 잘라서 내보냄")
+    trace.skip(name, f"재생성도 초과 — {field} {actual}자 > {limit}자, 잘라서 내보냄")
     return enforce(retry)
 
 
@@ -278,9 +291,25 @@ def _fit(ctx: Context, name: str, result: AiResult, regenerate) -> AiResult:
 class ToneCandidate:
     name = "tone"
 
-    def build(self, ctx: Context) -> AiResult | None:
-        gate = check_tone_gate(ctx.active)
-        ctx.trace.tone_gate = gate
+    def build(
+        self,
+        ctx: Context,
+        gate: ToneGateResult | None = None,
+        messages: list[Message] | None = None,
+        trace: Trace | None = None,
+    ) -> AiResult | None:
+        """`gate`·`messages`·`trace` 는 **선행 실행**(`run()`)이 넘긴다. 평소엔 비워 둔다.
+
+        말투 판정·생성 프롬프트가 보는 대화는 `ctx.context` 의 **마지막 4개**뿐이고
+        (`tone.CONTEXT_TURNS` + 방금 발화), `ctx.context` 는 활성 세그먼트를 앞 세그먼트로
+        4개까지 채운 것이라 그 마지막 4개는 **전체 스트림의 마지막 4개와 항상 같다.**
+        그래서 분절 전에 `ctx.messages` 를 넘겨도 LLM 이 보는 입력은 동일하다.
+        """
+        trace = trace or ctx.trace
+        if gate is None:
+            gate = check_tone_gate(ctx.active)
+        context = messages if messages is not None else ctx.context
+        trace.tone_gate = gate
         if not gate.triggered or gate.speaker is None:
             return None
 
@@ -288,14 +317,14 @@ class ToneCandidate:
         # 그것도 없으면 전체 스트림에서 계산한다 — 표본이 넓을수록 "평소 대비"가 정확해진다.
         # 판정 프롬프트의 직전 대화는 맥락(ctx.context)을 쓴다.
         profile = resolve_profile(gate.speaker, ctx.messages, ctx.request.speaker_profiles)
-        judged = tone_judge(ctx.context, gate, profile)
-        ctx.trace.tone_judged = judged
+        judged = tone_judge(context, gate, profile)
+        trace.tone_judged = judged
         if not judged.should_suggest:
-            ctx.trace.skip(self.name, "맥락 판정 — 갈등이 아님" + (" (장난)" if judged.is_playful else ""))
+            trace.skip(self.name, "맥락 판정 — 갈등이 아님" + (" (장난)" if judged.is_playful else ""))
             return None
 
         def _make() -> AiResult:
-            out = tone_suggest(ctx.context, gate, profile, judged)
+            out = tone_suggest(context, gate, profile, judged)
             return AiResult(
                 result_type="TONE_CORRECTION",
                 visibility_type="INDIVIDUAL",  # 보낸 사람에게만
@@ -315,7 +344,7 @@ class ToneCandidate:
         if not is_clean(result):
             result = _make()
             if not is_clean(result):
-                ctx.trace.skip(self.name, f"금지어 필터 — '{banned_in(result)}'")
+                trace.skip(self.name, f"금지어 필터 — '{banned_in(result)}'")
                 return None
 
         # 대체 문장에 거친 어휘가 남았으면 1회 재생성.
@@ -328,7 +357,7 @@ class ToneCandidate:
             if harsh_in(retry.result_data.alternative_sentence, profile) is None:
                 result = retry
             else:
-                ctx.trace.warn(self.name, f"대체 문장에 거친 표현이 남음 — '{harsh}'")
+                trace.warn(self.name, f"대체 문장에 거친 표현이 남음 — '{harsh}'")
 
         # 진단·이유가 원문에 없는 특징(안 찍은 마침표 등)을 주장하면 1회 재생성.
         # 거친 어휘와 같은 취급 — 품질 문제라 버리지는 않고, 남으면 흔적만 남긴다.
@@ -343,7 +372,7 @@ class ToneCandidate:
             if _claims(retry) is None:
                 result = retry
             else:
-                ctx.trace.warn(self.name, f"근거가 원문에 없음 — {claim}")
+                trace.warn(self.name, f"근거가 원문에 없음 — {claim}")
 
         # 대체 문장이 원문과 사실상 같으면 1회 재생성, 그래도 같으면 **내보내지 않는다.**
         #
@@ -355,10 +384,10 @@ class ToneCandidate:
             if not same_message(retry.result_data.alternative_sentence, gate.message or ""):
                 result = retry
             else:
-                ctx.trace.skip(self.name, "대체 문장이 원문과 같음 — 교정할 것이 없다")
+                trace.skip(self.name, "대체 문장이 원문과 같음 — 교정할 것이 없다")
                 return None
 
-        return _fit(ctx, self.name, result, _make)
+        return _fit(ctx, self.name, result, _make, trace)
 
 
 # --------------------------------------------------------------------------
@@ -637,11 +666,13 @@ def split(ctx: Context) -> None:
 
     이후 단계가 보는 범위가 여기서 정해진다. 설계는 `docs/design.md` 1부.
     """
-    result = segment(ctx.messages)
+    result = segment(ctx.messages, cache_key=str(ctx.request.chat_room_id))
     ctx.segments = result.segments
     ctx.context = active_context(ctx.segments)
     ctx.trace.segments = result.segments
     ctx.trace.scores = result.scores
+    ctx.trace.segment_cached = result.cached
+    ctx.trace.segment_scored = result.scored
 
 
 def read_state(ctx: Context) -> list[EmotionAnalysis]:
@@ -675,20 +706,34 @@ def read_state(ctx: Context) -> list[EmotionAnalysis]:
 def harvest_memories(ctx: Context) -> None:
     """대화에서 기억을 뽑아 저장소에 넣는다.
 
-    후보들보다 **먼저** 돈다. 방금 "마라탕 땡긴다"고 한 발화가 같은 요청의 데이트 코스
-    추천에 바로 반영되게 하기 위해서다.
+    **백그라운드로 돈다 — 응답을 기다리게 하지 않는다** (`run()` 상수 주석 ③). 이번 요청의
+    데이트 코스는 대화 원문을 프롬프트로 직접 받으므로 방금 "마라탕 땡긴다"고 한 발화는
+    저장소를 거치지 않아도 반영된다. 여기서 저장하는 것은 **다음 요청**을 위한 것이다.
 
     **활성 세그먼트만 본다.** 화제가 섞인 덩어리에서 인용을 뽑으면 맥락이 어긋난 기억이
     저장되고, 그게 나중에 추천 이유로 화면에 그대로 나간다. 과거 세그먼트는 이전 요청에서
     이미 추출됐다.
     """
-    extracted = extract_memories(ctx.active)
-    ctx.trace.extracted = extracted
-    ctx.trace.saved = save_memories(extracted, persist=ctx.persist)
+    try:
+        extracted = extract_memories(ctx.active)
+        ctx.trace.extracted = extracted
+        ctx.trace.saved = save_memories(extracted, persist=ctx.persist)
+    except Exception as exc:  # noqa: BLE001 — 추출 실패는 이번 요청의 결과를 바꾸지 않는다
+        # 예전에도 `run()` 이 이 future 의 결과를 안 읽어서 예외가 조용히 사라졌다.
+        # 백그라운드로 옮기면서 로그에라도 남긴다 — 응답은 이미 나간 뒤라 트레이스는 못 본다.
+        logging.getLogger("uvicorn.error").warning("기억 추출 실패 — %s", exc)
+
+
+# 응답 뒤에도 도는 작업용 풀. 기억 추출이 여기서 돈다 (`run()` 참조).
+# 4개면 충분하다 — 추출은 요청당 1회, 1~1.5초고, 다음 요청은 메시지 간격(수초~수분) 뒤에 온다.
+BACKGROUND_WORKERS = 4
+_background = ThreadPoolExecutor(max_workers=BACKGROUND_WORKERS, thread_name_prefix="kakapo-bg")
 
 
 def route(ctx: Context) -> list[AiResult]:
     """후보를 순서대로 돌린다. **`run()` 이 병렬로 도는 게 기본이고 이건 폴백이다.**
+
+    `split(ctx)` 를 먼저 부른 뒤에 써야 한다 — `run()` 과 달리 분절을 안에서 돌리지 않는다.
 
     동작이 같아야 하므로 `run()` 과 규칙을 공유한다 — 우선순위 순서, 유튜브 보류 조건,
     `trace.fired` 내용이 전부 동일하다. 병렬 실행을 끄고 원인을 좁힐 때 쓴다.
@@ -720,12 +765,11 @@ def route(ctx: Context) -> list[AiResult]:
 # 분절 이후 단계는 대부분 서로 독립인데 순차로 돌아서 시간이 그냥 더해지고 있었다.
 # 실측 14.0초짜리 요청에서 LLM 에만 12.0초를 썼다.
 #
-#     분절 ─┬─ 상태 산출                                  (독립)
-#           ├─ 기억 추출                                  (독립)
-#           ├─ 데이트 계획 → 카카오 → 데이트 문구           (독립)
-#           └─ 말투 판정 → 말투 생성 → 유튜브 (보류 판단)
-#
-# **의존이 둘 있고 둘 다 지킨다.**
+#     말투 판정 → 말투 생성 ──────────────────────┐ (분절을 안 기다린다 — 아래 ⓪)
+#     분절 ─┬─ 상태 산출                          │ (독립)
+#           ├─ 데이트 계획 → 카카오 → 데이트 문구   │ (독립)
+#           └─ 유튜브 (말투 결과를 본 뒤) ◀────────┘
+#     기억 추출 — 응답을 기다리게 하지 않는다 (백그라운드, 아래 ③)
 #
 # **의존은 하나뿐이다.** 말투 → 유튜브 — `SUPPRESS_YOUTUBE_WHEN_TONE` 판단에 말투 결과가
 # 필요하다. 미리 돌려놓고 버리는 방법도 있지만 유튜브는 쿼터가 하루 95회라 버리는 호출을
@@ -737,11 +781,36 @@ def route(ctx: Context) -> list[AiResult]:
 # 안에 그대로 있다. 기억 저장소를 거치는 것은 **과거 요청**에서 쌓인 기억을 찾기 위한
 # 경로고, 이번 요청의 발화는 거기 없어도 된다.
 #
-# 끊고 나니 데이트 체인이 기억 추출(1~2.6초)만큼 앞당겨진다. 설계 가치는 그대로다.
+# ── 2026-09-13 레이턴시 리팩토링 — 세 가지가 더 붙었다. 결과 규칙은 하나도 안 바뀐다. ──
+#
+# ⓪ **말투 후보는 분절을 기다리지 않는다 (선행 실행).** 분절이 맨 앞에 혼자 서서 모든
+#    단계가 기다리는 구조였는데, 말투 판정·생성이 보는 입력은 분절과 무관하다 —
+#    프롬프트에 들어가는 대화는 `ctx.context` 의 마지막 4개고 그건 전체 스트림의 마지막
+#    4개와 항상 같다 (`ToneCandidate.build` docstring). 게이트만 활성 세그먼트를 보는데
+#    (`_repetition_flag` 가 화자의 직전 발화 3개를 본다), 그것도 룰이라 즉시 계산된다.
+#
+#    그래서 룰 컷만 적용한 마지막 조각(`rule_tail`, LLM 없이 즉시)으로 게이트를 먼저 걸고
+#    말투 체인을 시작한 뒤, 분절이 끝나면 **활성 세그먼트로 게이트를 다시 계산해 신호가
+#    같은지 확인한다.** 같으면(거의 항상 — 화자의 직전 발화 3개 사이에 화제 경계가 걸릴
+#    때만 다르다) 선행 결과를 그대로 쓰고, 다르면 버리고 정식으로 다시 돈다. 어느 쪽이든
+#    **LLM 이 보는 입력은 예전과 동일하다** — 시점만 앞당긴다.
+#
+#    선행 실행은 자기 트레이스(`Trace()`)에 기록하고 채택될 때만 본 트레이스로 옮긴다.
+#    버려진 실행이 늦게 끝나 본 트레이스를 덮어쓰는 경합을 막기 위해서다.
+#
+# ① 분절 점수 캐시 (`segment.py`) — 여기가 아니라 분절 안이다. 같은 발화를 요청마다 다시
+#    채점하지 않아 분절이 창 30개에서 3~4초 → 새 발화 한두 개 채점 ~1초가 된다.
+#
+# ③ **기억 추출은 응답을 기다리게 하지 않는다.** 이번 요청의 결과에 쓰이지 않는다(위
+#    "의존을 끊었다" 참조) — 저장소에 넣는 것은 **다음 요청**을 위해서다. 그래서
+#    백그라운드 풀에 던지고 응답은 먼저 나간다. 다음 요청은 메시지 간격(수초~수분) 뒤라
+#    그때는 저장이 끝나 있다. CLI·devui 는 `analyze(wait_background=True)` 로 기다려서
+#    추출 결과를 그대로 보여준다. 응답 시간에서 빠지는 것은 "추출이 상태 산출보다 길었던
+#    만큼"(0~1초)이다.
 #
 # LLM·HTTP 대기가 전부라 스레드로 충분하다 (GIL 이 문제되지 않는다).
-# 동시에 던지는 작업 수. **5개까지 나갈 수 있다** — 상태 · 기억 추출 · 데이트 · 말투 ·
-# 유튜브. 4로 두면 유튜브가 슬롯을 기다리느라 병렬이 반쯤 무너진다 (실측에서 확인).
+# 동시에 던지는 작업 수. **5개까지 나갈 수 있다** — 상태 · 말투(선행) · 말투(재실행) ·
+# 데이트 · 유튜브. 4로 두면 유튜브가 슬롯을 기다리느라 병렬이 반쯤 무너진다 (실측에서 확인).
 MAX_WORKERS = 6
 
 
@@ -749,8 +818,22 @@ def _build(candidate: Candidate, ctx: Context) -> AiResult | None:
     return candidate.build(ctx)
 
 
+def _same_gate(a: ToneGateResult, b: ToneGateResult) -> bool:
+    """선행 실행의 게이트와 정식 게이트가 같은 판정인가 — 신호 목록까지 같아야 한다.
+
+    신호(`flags`)는 프롬프트에 "룰이 잡은 신호"로 그대로 들어가므로, 하나라도 다르면
+    LLM 입력이 달라진 것이라 선행 결과를 쓸 수 없다.
+    """
+    return (
+        a.triggered == b.triggered
+        and a.speaker == b.speaker
+        and a.message_id == b.message_id
+        and a.flags == b.flags
+    )
+
+
 def run(ctx: Context) -> tuple[list[EmotionAnalysis], list[AiResult]]:
-    """분절 이후 전체를 돌린다. 독립인 것은 동시에.
+    """분절부터 전체를 돌린다. 독립인 것은 동시에. **분절도 여기서 돈다** (말투 선행 실행 때문).
 
     **결과 순서는 `CANDIDATES` 우선순위 그대로다.** 완료 순서로 담으면 요청마다 배열
     순서가 바뀌고, 프론트가 `results[0]` 을 쓰기로 하면 화면이 달라진다.
@@ -758,13 +841,36 @@ def run(ctx: Context) -> tuple[list[EmotionAnalysis], list[AiResult]]:
     tone, date, youtube = CANDIDATES
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        f_state = pool.submit(read_state, ctx)
-        f_tone = pool.submit(_build, tone, ctx)
-        f_memory = pool.submit(harvest_memories, ctx)
-        f_date = pool.submit(_build, date, ctx)
+        # ⓪ 말투 선행 실행 — 분절 전에 시작한다 (상수 주석 참조). 게이트가 안 걸리면
+        #    LLM 호출이 없으므로 시작할 것도 없다.
+        early_gate = check_tone_gate(rule_tail(ctx.messages))
+        early_trace = Trace()
+        f_early: Future | None = None
+        if early_gate.triggered:
+            f_early = pool.submit(tone.build, ctx, early_gate, ctx.messages, early_trace)
 
-        # 유튜브는 말투 결과를 알아야 한다 (의존 ②)
+        split(ctx)
+
+        gate = check_tone_gate(ctx.active)
+        if f_early is not None and _same_gate(gate, early_gate):
+            f_tone = f_early
+        else:
+            if f_early is not None:
+                # 화자의 직전 발화 3개 사이에 화제 경계가 걸린 드문 경우 — 정식으로 다시 돈다.
+                # 선행 실행은 자기 트레이스에만 쓰므로 그냥 둔다 (결과를 읽지 않는다).
+                ctx.trace.warn(tone.name, "선행 실행 게이트가 활성 세그먼트와 달라 다시 판정")
+            early_trace = ctx.trace
+            f_tone = pool.submit(tone.build, ctx, gate, None, ctx.trace)
+
+        f_state = pool.submit(read_state, ctx)
+        f_date = pool.submit(_build, date, ctx)
+        # ③ 기억 추출 — 응답을 기다리게 하지 않는다 (상수 주석 참조)
+        ctx.trace.background.append(_background.submit(harvest_memories, ctx))
+
+        # 유튜브는 말투 결과를 알아야 한다 (의존)
         tone_result = f_tone.result()
+        if early_trace is not ctx.trace:
+            ctx.trace.absorb_tone(early_trace)
         if SUPPRESS_YOUTUBE_WHEN_TONE and tone_result is not None:
             ctx.trace.skip(youtube.name, "말투 교정이 발동한 요청 — 냉각기가 아니므로 보류")
             f_youtube = None
